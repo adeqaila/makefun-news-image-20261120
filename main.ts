@@ -4,10 +4,12 @@
 //
 // The front page is the entry.png sitting next to this file. It is JPEG
 // bytes under the required entry.png name, which the rules allow: the file
-// is told apart by its first bytes, not by its name. The program checks
-// the bytes against the competition gate (a whole image, at most 1 MiB,
-// at most 1024 by 1024 pixels), then writes them unchanged to the output
-// directory, so repeated grader runs produce byte-identical output.
+// is told apart by its first bytes, not by its name. The program validates
+// the JPEG magic bytes (SOI FF D8 … EOI FF D9), walks the JPEG segments to
+// read its size, then checks the bytes against the competition gate (a whole
+// image, at most 1 MiB, at most 1024 by 1024 pixels), and writes them
+// unchanged to the output directory, so repeated grader runs produce
+// byte-identical output.
 //
 // The output directory is a mount the grader owns: the program creates it
 // if needed, empties only what is inside it, and never removes the
@@ -33,6 +35,7 @@ function main() {
 
   const bytes = readFileSync(source);
   if (bytes.length === 0) fail('entry.png is empty');
+  if (bytes.length < 4) fail('entry.png is too short to be a JPEG');
   if (bytes.length > LIMIT_BYTES) {
     fail(`entry.png is ${bytes.length} bytes, over the ${LIMIT_BYTES} byte gate`);
   }
@@ -41,15 +44,33 @@ function main() {
   if (bytes[bytes.length - 2] !== 0xff || bytes[bytes.length - 1] !== 0xd9) {
     fail('entry.png is not a whole JPEG (missing end marker)');
   }
-  // SOF0 (FF C0) carries height then width, both big-endian, 16-bit.
+  // Walk the JPEG segments to find SOF0 (FF C0), which carries height then
+  // width, both big-endian, 16-bit. Walking segments — instead of scanning
+  // raw bytes — avoids mistaking a FF C0 pair inside compressed image data
+  // for the size header. Segment length includes its own 2 length bytes.
   let w = 0;
   let h = 0;
-  for (let i = 2; i + 8 < bytes.length; i += 1) {
-    if (bytes[i] === 0xff && bytes[i + 1] === 0xc0) {
-      h = (bytes[i + 5] << 8) | bytes[i + 6];
-      w = (bytes[i + 7] << 8) | bytes[i + 8];
+  let pos = 2; // just past the SOI marker
+  while (pos + 3 < bytes.length) {
+    if (bytes[pos] !== 0xff) fail('entry.png has a broken JPEG segment');
+    const marker = bytes[pos + 1];
+    if (marker === 0xd9) break; // EOI before any SOF0: no size header
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      pos += 2; // standalone marker, no length field
+      continue;
+    }
+    if (marker === 0xda) break; // SOS: image data follows, no SOF0 after this
+    const segLen = (bytes[pos + 2] << 8) | bytes[pos + 3];
+    if (segLen < 2 || pos + 2 + segLen > bytes.length) {
+      fail('entry.png has a broken JPEG segment');
+    }
+    if (marker === 0xc0) {
+      if (segLen < 7) fail('entry.png has a broken SOF0 segment');
+      h = (bytes[pos + 5] << 8) | bytes[pos + 6];
+      w = (bytes[pos + 7] << 8) | bytes[pos + 8];
       break;
     }
+    pos += 2 + segLen;
   }
   if (w === 0 || h === 0) fail('entry.png has no JPEG size header');
   if (w > LIMIT_PIXELS || h > LIMIT_PIXELS) {
